@@ -2,9 +2,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
-import mat73
 import numpy as np
-from sklearn.model_selection import LeaveOneOut
 from sklearn.metrics import confusion_matrix
 import seaborn as sns
 import matplotlib.pyplot as plt
@@ -78,72 +76,54 @@ def save_heatmap(cm, iteration, accuracy, output_dir='output_swap'):
     plt.savefig(os.path.join(output_dir, f'confusion_matrix_iter_{iteration}.png'))
     plt.close()
 
+def train_test_loso(lo_sub, path="np_files", n_sub=28):
+    #load the test data
+    X_test_path = os.path.join(path, f'X_PS_SR_{lo_sub}.npy')
+    y_test_path = os.path.join(path, f'y_PS_{lo_sub}.npy')
+    X_test = np.load(X_test_path).squeeze(-1)  #remove the extra dimension
+    y_test = np.load(y_test_path)
+    
+    #load the training data
+    X_train = []
+    y_train = []
+    for sub_id in range(n_sub):
+        if sub_id != lo_sub:
+            X_path = os.path.join(path, f'X_PS_SR_{sub_id}.npy')
+            y_path = os.path.join(path, f'y_PS_{sub_id}.npy')
+            X_train.append(np.load(X_path).squeeze(-1))  #remove the extra dimension
+            y_train.append(np.load(y_path))
+    
+    #concatenate all training data
+    X_train = np.concatenate(X_train, axis=0)
+    y_train = np.concatenate(y_train, axis=0)
+    
+    return X_train, y_train, X_test, y_test
 
-thermal_dict = mat73.loadmat('data_PS_SR.mat')
-thermal_tr_con = thermal_dict.get('data_m', None)
-
-y_thermal_dict = mat73.loadmat('y_PS.mat')
-y_thermal = y_thermal_dict.get('y_PS', None)
-
-if thermal_tr_con is None or y_thermal is None:
-    raise ValueError("Failed to load the data. Please check the data files.")
-
-print(f"Original shape of thermal_tr_con: {np.shape(thermal_tr_con)}")
-print(f"Original shape of y_thermal: {np.shape(y_thermal)}")
-
-X = np.array(thermal_tr_con)
-y = np.array(y_thermal)
-
-X = (X - np.mean(X, axis=3, keepdims=True)) / np.std(X, axis=3, keepdims=True)
-X = X[:, :, :, 600:1600, :]
-
-print(f"Shape of X after cropping: {X.shape}")
-if X.shape[3] != 1000:
-    raise ValueError(f"Unexpected shape after cropping: {X.shape}")
-
-#swap axes to bring trials to the front
-X = X.swapaxes(1, 4).squeeze(-1)  # (28, 80, 59, 1000)
-
-#flatten the labels to match the new X shape using swapaxes
-y = y.swapaxes(1, 2).squeeze(-1)  #(28, 80)
-
-#verify the shapes
-print(f"Shape of X after swapping axes: {X.shape}")
-print(f"Shape of y after swapping axes: {y.shape}")
-
-#the data is in the shape (28, 80, 59, 1000) and (28, 80) respectively, 
-# with trials kept separate.
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-loo = LeaveOneOut()
 all_test_accuracies = []
 all_y_true = []
 all_y_pred = []
-iteration = 0
 
-for train_index, test_index in loo.split(np.arange(X.shape[0])):
-    iteration += 1
+for subject_id in range(28):
+    print(f"Training with subject {subject_id} left out as test set")
     
-    #select train and test subjects
-    X_train = X[train_index].reshape(-1, 59, 1000)
-    y_train = y[train_index].reshape(-1)
-    X_test = X[test_index].reshape(-1, 59, 1000)
-    y_test = y[test_index].reshape(-1)
+    X_train, y_train, X_test, y_test = train_test_loso(subject_id)
 
-    if len(y_test) == 0:
-        print(f"Skipping iteration {iteration} due to empty test set.")
-        continue
-
+    #convert data to PyTorch tensors
     X_train_tensor = torch.tensor(X_train, dtype=torch.float32).to(device)
     y_train_tensor = torch.tensor(y_train, dtype=torch.long).to(device)
     X_test_tensor = torch.tensor(X_test, dtype=torch.float32).to(device)
     y_test_tensor = torch.tensor(y_test, dtype=torch.long).to(device)
 
+    
+    print(f"X_train_tensor shape: {X_train_tensor.shape}")
+
     train_dataset = TensorDataset(X_train_tensor, y_train_tensor)
     test_dataset = TensorDataset(X_test_tensor, y_test_tensor)
 
-    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)  
+    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
     test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
 
     model = CNN_LSTM().to(device)
@@ -223,11 +203,11 @@ for train_index, test_index in loo.split(np.arange(X.shape[0])):
     all_test_accuracies.append(test_accuracy)
     all_y_true.extend(y_true)
     all_y_pred.extend(y_pred)
-    print(f'Test Accuracy: {test_accuracy:.2f}%')
+    print(f'Test Accuracy for subject {subject_id}: {test_accuracy:.2f}%')
 
     cm = confusion_matrix(y_true, y_pred)
     cm = (cm.astype('float') / cm.sum(axis=1)[:, np.newaxis]) * 100
-    save_heatmap(cm, iteration, test_accuracy)
+    save_heatmap(cm, subject_id, test_accuracy)
 
 average_accuracy = np.mean(all_test_accuracies) if all_test_accuracies else 0
 print(f'Average Test Accuracy: {average_accuracy:.2f}%')
