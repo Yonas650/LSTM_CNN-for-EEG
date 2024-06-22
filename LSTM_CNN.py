@@ -68,7 +68,7 @@ class CNN_LSTM(nn.Module):
         x = self.fc2(x)
         return x
 
-def save_heatmap(cm, iteration, accuracy, output_dir='output2_classprint'):
+def save_heatmap(cm, iteration, accuracy, output_dir='output_swap'):
     plt.figure(figsize=(10, 7))
     sns.heatmap(cm, annot=True, fmt='.2f', cmap='Blues')
     plt.title(f'Confusion Matrix - Iteration {iteration} - Accuracy: {accuracy:.2f}%')
@@ -78,7 +78,7 @@ def save_heatmap(cm, iteration, accuracy, output_dir='output2_classprint'):
     plt.savefig(os.path.join(output_dir, f'confusion_matrix_iter_{iteration}.png'))
     plt.close()
 
-#load data
+
 thermal_dict = mat73.loadmat('data_PS_SR.mat')
 thermal_tr_con = thermal_dict.get('data_m', None)
 
@@ -101,21 +101,20 @@ print(f"Shape of X after cropping: {X.shape}")
 if X.shape[3] != 1000:
     raise ValueError(f"Unexpected shape after cropping: {X.shape}")
 
-X = X.transpose(0, 4, 2, 3, 1).reshape(-1, 59, 1000)
-y = y.transpose(0, 2, 1).reshape(-1)
+#swap axes to bring trials to the front
+X = X.swapaxes(1, 4).squeeze(-1)  # (28, 80, 59, 1000)
 
-print(f"Shape of X: {X.shape}")
-print(f"Shape of y: {y.shape}")
+#flatten the labels to match the new X shape using swapaxes
+y = y.swapaxes(1, 2).squeeze(-1)  #(28, 80)
 
-#print class distribution
-unique, counts = np.unique(y, return_counts=True)
-class_distribution = dict(zip(unique, counts))
-print(f"Class distribution: {class_distribution}")
+#verify the shapes
+print(f"Shape of X after swapping axes: {X.shape}")
+print(f"Shape of y after swapping axes: {y.shape}")
+
+#the data is in the shape (28, 80, 59, 1000) and (28, 80) respectively, 
+# with trials kept separate.
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-X_tensor = torch.tensor(X, dtype=torch.float32).to(device)
-y_tensor = torch.tensor(y, dtype=torch.long).to(device)
 
 loo = LeaveOneOut()
 all_test_accuracies = []
@@ -123,32 +122,38 @@ all_y_true = []
 all_y_pred = []
 iteration = 0
 
-for train_index, test_index in loo.split(np.arange(X.shape[0]) // 80):
+for train_index, test_index in loo.split(np.arange(X.shape[0])):
     iteration += 1
-    train_subjects = np.isin(np.arange(X.shape[0]) // 80, train_index)
-    test_subjects = np.isin(np.arange(X.shape[0]) // 80, test_index)
-
-    X_train, X_test = X_tensor[train_subjects], X_tensor[test_subjects]
-    y_train, y_test = y_tensor[train_subjects], y_tensor[test_subjects]
+    
+    #select train and test subjects
+    X_train = X[train_index].reshape(-1, 59, 1000)
+    y_train = y[train_index].reshape(-1)
+    X_test = X[test_index].reshape(-1, 59, 1000)
+    y_test = y[test_index].reshape(-1)
 
     if len(y_test) == 0:
         print(f"Skipping iteration {iteration} due to empty test set.")
         continue
 
-    train_dataset = TensorDataset(X_train, y_train)
-    test_dataset = TensorDataset(X_test, y_test)
+    X_train_tensor = torch.tensor(X_train, dtype=torch.float32).to(device)
+    y_train_tensor = torch.tensor(y_train, dtype=torch.long).to(device)
+    X_test_tensor = torch.tensor(X_test, dtype=torch.float32).to(device)
+    y_test_tensor = torch.tensor(y_test, dtype=torch.long).to(device)
 
-    train_loader = DataLoader(train_dataset, batch_size=16, shuffle=True)
-    test_loader = DataLoader(test_dataset, batch_size=16, shuffle=False)
+    train_dataset = TensorDataset(X_train_tensor, y_train_tensor)
+    test_dataset = TensorDataset(X_test_tensor, y_test_tensor)
+
+    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)  
+    test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
 
     model = CNN_LSTM().to(device)
     criterion = nn.CrossEntropyLoss()
-    optimizer = optim.AdamW(model.parameters(), lr=0.0001, weight_decay=1e-5)
-    scheduler = optim.lr_scheduler.OneCycleLR(optimizer, max_lr=0.001, steps_per_epoch=len(train_loader), epochs=100)
+    optimizer = optim.AdamW(model.parameters(), lr=0.0001, weight_decay=1e-4)
+    scheduler = optim.lr_scheduler.OneCycleLR(optimizer, max_lr=0.001, steps_per_epoch=len(train_loader), epochs=200)
 
-    num_epochs = 100
+    num_epochs = 200 
     best_val_accuracy = 0
-    patience = 10
+    patience = 15 
     trigger_times = 0
 
     for epoch in range(num_epochs):
@@ -220,12 +225,14 @@ for train_index, test_index in loo.split(np.arange(X.shape[0]) // 80):
     all_y_pred.extend(y_pred)
     print(f'Test Accuracy: {test_accuracy:.2f}%')
 
-    cm = confusion_matrix(y_true, y_pred, normalize='true') * 100
+    cm = confusion_matrix(y_true, y_pred)
+    cm = (cm.astype('float') / cm.sum(axis=1)[:, np.newaxis]) * 100
     save_heatmap(cm, iteration, test_accuracy)
 
 average_accuracy = np.mean(all_test_accuracies) if all_test_accuracies else 0
 print(f'Average Test Accuracy: {average_accuracy:.2f}%')
 
 if all_test_accuracies:
-    cm = confusion_matrix(all_y_true, all_y_pred, normalize='true') * 100
+    cm = confusion_matrix(all_y_true, all_y_pred)
+    cm = (cm.astype('float') / cm.sum(axis=1)[:, np.newaxis]) * 100
     save_heatmap(cm, 'average', average_accuracy)
